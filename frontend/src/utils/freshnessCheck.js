@@ -1,46 +1,85 @@
-const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`
+import { supabase } from '../lib/supabaseClient'
 
-function fileToBase64(file) {
+// Resizes the photo (max 1024px) and converts it to base64 so the upload is faster.
+function resizeToBase64(file, maxSize = 1024) {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => resolve(reader.result.split(',')[1])
-    reader.onerror = reject
-    reader.readAsDataURL(file)
+    const img = new Image()
+    const url = URL.createObjectURL(file)
+    img.onload = () => {
+      const scale = Math.min(1, maxSize / Math.max(img.width, img.height))
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.round(img.width * scale)
+      canvas.height = Math.round(img.height * scale)
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height)
+      URL.revokeObjectURL(url)
+      resolve(canvas.toDataURL('image/jpeg', 0.8).split(',')[1])
+    }
+    img.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('image load failed'))
+    }
+    img.src = url
   })
 }
 
+const UNUSABLE_MESSAGES = {
+  blurry: 'The photo is blurry. Please take a clearer photo and try again.',
+  dark: 'The photo is too dark. Please retake it in better lighting.',
+  not_food: 'No food was detected in the photo. Please upload a photo of the food.',
+  obscured: 'The food is not fully visible. Please retake the photo.',
+}
+
+function labelFor(score) {
+  if (score >= 80) return 'good'
+  if (score >= 60) return 'fair'
+  if (score >= 40) return 'low'
+  return 'poor'
+}
+
+// Result: { ok: true, score, category, foodDetected, issues, confidence, needsReview }
+//  or: { ok: false, message }  (never returns a placeholder score)
 export async function analyzeFoodFreshness(imageFile) {
   try {
-    const base64Image = await fileToBase64(imageFile)
+    const base64Image = await resizeToBase64(imageFile)
 
-    const prompt = `You are a food safety inspector. Look at this food image and respond ONLY in this exact JSON format, nothing else:
-{"score": <number 0-100 representing freshness, 100=very fresh, 0=spoiled>, "category": "<one of: fresh, good, moderate, poor, spoiled>", "reason": "<one short sentence explaining why>"}`
-
-    const response = await fetch(GEMINI_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [
-          {
-            parts: [
-              { text: prompt },
-              { inline_data: { mime_type: imageFile.type, data: base64Image } }
-            ]
-          }
-        ]
-      })
+    const { data, error } = await supabase.functions.invoke('analyze-food', {
+      body: { image_base64: base64Image, mime_type: 'image/jpeg' },
     })
 
-    const data = await response.json()
-    const rawText = data.candidates[0].content.parts[0].text
-    const cleanText = rawText.replace(/```json|```/g, '').trim()
-    const result = JSON.parse(cleanText)
+    if (error || !data || data.error) {
+      console.error('analyze-food failed:', error || data)
+      return { ok: false, message: 'The visual quality check is temporarily unavailable. Please try again in a few minutes.' }
+    }
 
-    return result
-  } catch (error) {
-    console.error('Freshness check failed:', error)
-    return { score: 50, category: 'moderate', reason: 'AI analysis failed - manual review needed' }
+    if (!data.image_usable) {
+      return {
+        ok: false,
+        message: UNUSABLE_MESSAGES[data.unusable_reason] || 'The photo could not be analyzed. Please take another photo.',
+      }
+    }
+
+    const rawScore = Number(data.visual_quality)
+    if (Number.isNaN(rawScore)) {
+      return { ok: false, message: 'The analysis result was incomplete. Please try again.' }
+    }
+
+    // Deterministic adjustment: 10 points are deducted for each visible issue.
+    const issues = Array.isArray(data.visible_issues) ? data.visible_issues : []
+    const score = Math.max(0, Math.min(100, Math.round(rawScore - issues.length * 10)))
+    const confidence = Number(data.confidence) || 0
+
+    return {
+      ok: true,
+      score,
+      category: labelFor(score),
+      foodDetected: data.food_detected || null,
+      issues,
+      confidence,
+      needsReview: Boolean(data.needs_human_review) || confidence < 0.6 || score < 40,
+    }
+  } catch (err) {
+    console.error('Freshness check failed:', err)
+    return { ok: false, message: 'The photo could not be processed. Please try again.' }
   }
 }
 

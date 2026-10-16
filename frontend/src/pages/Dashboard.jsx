@@ -7,7 +7,7 @@ export default function Dashboard() {
   const { profile, loading } = useAuth()
 
   if (loading) return <p className="text-center mt-10">Loading...</p>
-  if (!profile) return <p className="text-center mt-10">Profile not found. Try logging in again.</p>
+  if (!profile) return <p className="text-center mt-10">Your profile could not be loaded. Please log in again.</p>
 
   if (profile.role === 'donor') return <DonorArea />
   if (profile.role === 'ngo') return <NGOArea />
@@ -15,7 +15,7 @@ export default function Dashboard() {
 
   return (
     <div className="text-center mt-10">
-      <p>Volunteer dashboard - jald hi add hoga.</p>
+      <p>The volunteer dashboard is coming soon.</p>
     </div>
   )
 }
